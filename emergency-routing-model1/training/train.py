@@ -152,27 +152,32 @@ def save_checkpoint(
     epoch: int,
     val_loss: float,
     path: str,
+    spatial_proj: nn.Linear = None,
 ) -> None:
     """Persist model + optimiser state for later resumption or inference.
 
     Parameters
     ----------
-    model:     Trained model.
-    optimizer: Optimiser with current momentum/state.
-    epoch:     Current epoch number.
-    val_loss:  Validation loss that triggered this save.
-    path:      Destination file path.
+    model:        Trained model.
+    optimizer:    Optimiser with current momentum/state.
+    epoch:        Current epoch number.
+    val_loss:     Validation loss that triggered this save.
+    path:         Destination file path.
+    spatial_proj: Optional spatial projection layer (4 → gcn_input_dim).
+                  If provided, its state dict is stored under
+                  'spatial_proj_state_dict' so evaluate.py and predict.py
+                  can reload it without retraining.
     """
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "epoch":                epoch,
-            "model_state_dict":     model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "val_loss":             val_loss,
-        },
-        path,
-    )
+    ckpt = {
+        "epoch":                epoch,
+        "model_state_dict":     model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "val_loss":             val_loss,
+    }
+    if spatial_proj is not None:
+        ckpt["spatial_proj_state_dict"] = spatial_proj.state_dict()
+    torch.save(ckpt, path)
     logger.info(
         "save_checkpoint: epoch=%d val_loss=%.6f → %s",
         epoch, val_loss, path,
@@ -420,7 +425,8 @@ def train(config: dict) -> EmergencyTrafficModel:
         if val_loss < best_val_loss:
             best_val_loss  = val_loss
             patience_count = 0
-            save_checkpoint(model, optimizer, epoch, val_loss, best_ckpt_path)
+            save_checkpoint(model, optimizer, epoch, val_loss, best_ckpt_path,
+                        spatial_proj=spatial_proj)
             logger.info("train: new best model saved (val_loss=%.6f)", val_loss)
         else:
             patience_count += 1

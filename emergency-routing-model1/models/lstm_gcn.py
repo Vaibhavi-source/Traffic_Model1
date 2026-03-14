@@ -27,10 +27,61 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import logging
+import importlib
 from typing import Tuple, Dict, Optional
-from torch_geometric.nn import GCNConv
+
+try:
+    _pyg_nn = importlib.import_module("torch_geometric.nn")
+    GCNConv = _pyg_nn.GCNConv
+except ImportError:
+    GCNConv = None
 
 logger = logging.getLogger(__name__)
+
+
+class _FallbackGCNConv(nn.Module):
+    """Lightweight GCN fallback used when torch_geometric is unavailable."""
+
+    def __init__(self, in_features: int, out_features: int) -> None:
+        super().__init__()
+        self.linear = nn.Linear(in_features, out_features)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_weight: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        num_nodes = x.size(0)
+        device = x.device
+        dtype = x.dtype
+
+        row = edge_index[0].long()
+        col = edge_index[1].long()
+
+        if edge_weight is None:
+            edge_weight = torch.ones(row.size(0), device=device, dtype=dtype)
+        else:
+            edge_weight = edge_weight.to(device=device, dtype=dtype)
+
+        # Add self loops for numerical stability similar to standard GCN.
+        self_loops = torch.arange(num_nodes, device=device)
+        row = torch.cat([row, self_loops], dim=0)
+        col = torch.cat([col, self_loops], dim=0)
+        edge_weight = torch.cat(
+            [edge_weight, torch.ones(num_nodes, device=device, dtype=dtype)],
+            dim=0,
+        )
+
+        deg = torch.zeros(num_nodes, device=device, dtype=dtype)
+        deg = deg.index_add(0, row, edge_weight)
+        deg_inv_sqrt = deg.pow(-0.5)
+        deg_inv_sqrt[torch.isinf(deg_inv_sqrt)] = 0.0
+        norm = deg_inv_sqrt[row] * edge_weight * deg_inv_sqrt[col]
+
+        out = torch.zeros_like(x)
+        out = out.index_add(0, row, x[col] * norm.unsqueeze(-1))
+        return self.linear(out)
 
 
 # ---------------------------------------------------------------------------
@@ -51,7 +102,13 @@ class GCNLayer(nn.Module):
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
-        self.conv    = GCNConv(in_features, out_features)
+        conv_cls = GCNConv if GCNConv is not None else _FallbackGCNConv
+        if GCNConv is None:
+            logger.warning(
+                "torch_geometric not found; using fallback graph convolution. "
+                "Install torch-geometric for production-quality graph ops."
+            )
+        self.conv    = conv_cls(in_features, out_features)
         self.bn      = nn.BatchNorm1d(out_features)
         self.dropout = nn.Dropout(dropout)
 
@@ -309,16 +366,19 @@ class EmergencyTrafficModel(nn.Module):
             preds, unc = self.forward(
                 x_temporal, x_spatial, edge_index, edge_weight,
             )
-        return {
-            "congestion_t5":   preds[:, 0].cpu().numpy(),
-            "congestion_t10":  preds[:, 1].cpu().numpy(),
-            "congestion_t20":  preds[:, 2].cpu().numpy(),
-            "congestion_t30":  preds[:, 3].cpu().numpy(),
-            "uncertainty_t5":  unc[:, 0].cpu().numpy(),
-            "uncertainty_t10": unc[:, 1].cpu().numpy(),
-            "uncertainty_t20": unc[:, 2].cpu().numpy(),
-            "uncertainty_t30": unc[:, 3].cpu().numpy(),
-        }
+        horizons = [5, 10, 20, 30]
+        result: dict = {}
+        n_horizons = preds.size(1)
+
+        for idx in range(n_horizons):
+            if idx < len(horizons):
+                suffix = f"t{horizons[idx]}"
+            else:
+                suffix = f"h{idx + 1}"
+            result[f"congestion_{suffix}"] = preds[:, idx].cpu().numpy()
+            result[f"uncertainty_{suffix}"] = unc[:, idx].cpu().numpy()
+
+        return result
 
 
 # ---------------------------------------------------------------------------

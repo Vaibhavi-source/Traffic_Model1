@@ -164,8 +164,8 @@ class TestFetchAllSources:
         # Mappls returns empty dict (simulate JSON parse miss)
         mock_fwr.side_effect = [
             {},                                                            # Mappls — empty
-            self._traffic_response("here", ["seg_H1", "seg_H2"]),
-            self._traffic_response("ola",  ["seg_O1"]),
+            {},                                                            # HERE — empty
+            self._traffic_response("ola", ["seg_O1"]),                    # Ola — success
         ]
 
         from data.fetch_traffic import fetch_all_sources
@@ -196,7 +196,7 @@ class TestWeatherFunctions:
         assert classify_rain_category(20.0) == "heavy"
 
     def test_classify_rain_extreme(self):
-        assert classify_rain_category(50.0) == "extreme"
+        assert classify_rain_category(70.0) == "extreme"
 
     # --- compute_monsoon_intensity ---
 

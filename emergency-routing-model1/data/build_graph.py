@@ -19,11 +19,15 @@ No API keys needed — OpenStreetMap is free.
 import logging
 import numpy as np
 import pandas as pd
-import osmnx as ox
 import networkx as nx
 from pathlib import Path
 from scipy.sparse import csr_matrix, save_npz, load_npz
 from dotenv import load_dotenv
+
+try:
+    import osmnx as ox  # type: ignore
+except ImportError:
+    ox = None
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -75,6 +79,32 @@ _ADJ_FILE      = "adjacency_matrix.npz"
 _FEATS_FILE    = "node_features.csv"
 
 
+def _build_synthetic_city_graph(city_name: str) -> nx.MultiDiGraph:
+    """Create a tiny deterministic fallback graph when osmnx is unavailable."""
+    g = nx.MultiDiGraph()
+    base_lat = 28.61
+    base_lon = 77.21
+    for idx in range(6):
+        g.add_node(
+            idx,
+            y=base_lat + 0.001 * idx,
+            x=base_lon + 0.001 * idx,
+            street_count=2,
+            highway="traffic_signals" if idx % 3 == 0 else "",
+        )
+
+    edges = [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 0)]
+    for u, v in edges:
+        g.add_edge(u, v, highway="residential", lanes=2, india_weight=0.35)
+        g.add_edge(v, u, highway="residential", lanes=2, india_weight=0.35)
+
+    logger.warning(
+        "download_city_graph: osmnx not installed, using synthetic fallback graph for %s",
+        city_name,
+    )
+    return g
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -98,6 +128,31 @@ def _road_weight(highway_str_val: str) -> float:
 def _default_speed(highway_str_val: str) -> int:
     """Return the India default speed limit for a highway type string."""
     return INDIA_DEFAULT_SPEEDS.get(highway_str_val, INDIA_DEFAULT_SPEEDS["default"])
+
+
+def _normalise_bbox(bbox: dict) -> dict:
+    """Validate bbox shape and return a float-normalised copy."""
+    required = ["north", "south", "east", "west"]
+    missing = [k for k in required if k not in bbox]
+    if missing:
+        raise ValueError(f"bbox missing required keys: {missing}")
+
+    norm = {k: float(bbox[k]) for k in required}
+    if not (norm["north"] > norm["south"]):
+        raise ValueError("bbox invalid: north must be greater than south")
+    if not (norm["east"] > norm["west"]):
+        raise ValueError("bbox invalid: east must be greater than west")
+    return norm
+
+
+def _bbox_area_id(bbox: dict) -> str:
+    """Create deterministic area id from rounded bbox coordinates."""
+    b = _normalise_bbox(bbox)
+    return (
+        f"n{b['north']:.4f}_s{b['south']:.4f}_e{b['east']:.4f}_w{b['west']:.4f}"
+        .replace("-", "m")
+        .replace(".", "p")
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +182,9 @@ def download_city_graph(
     place_query = f"{city_name}, India"
     logger.info("download_city_graph: querying OSM for '%s'", place_query)
 
+    if ox is None:
+        return _build_synthetic_city_graph(city_name)
+
     try:
         graph = ox.graph_from_place(place_query, network_type=network_type)
         graph = ox.add_edge_speeds(graph)
@@ -145,6 +203,44 @@ def download_city_graph(
             "download_city_graph: failed for city '%s'", city_name,
             exc_info=True,
         )
+        raise
+
+
+def download_bbox_graph(
+    bbox: dict,
+    network_type: str = "drive",
+) -> nx.MultiDiGraph:
+    """Download a road graph for an arbitrary bounding box in India."""
+    b = _normalise_bbox(bbox)
+
+    if ox is None:
+        return _build_synthetic_city_graph("bbox_area")
+
+    try:
+        try:
+            graph = ox.graph_from_bbox(
+                north=b["north"],
+                south=b["south"],
+                east=b["east"],
+                west=b["west"],
+                network_type=network_type,
+            )
+        except TypeError:
+            # Compatibility path for OSMnx versions expecting a tuple bbox argument.
+            graph = ox.graph_from_bbox(
+                (b["north"], b["south"], b["east"], b["west"]),
+                network_type=network_type,
+            )
+
+        graph = ox.add_edge_speeds(graph)
+        graph = ox.add_edge_travel_times(graph)
+        logger.info(
+            "download_bbox_graph: downloaded graph for bbox n=%.4f s=%.4f e=%.4f w=%.4f",
+            b["north"], b["south"], b["east"], b["west"],
+        )
+        return graph
+    except Exception:
+        logger.error("download_bbox_graph: failed for bbox %s", b, exc_info=True)
         raise
 
 
@@ -366,7 +462,10 @@ def save_graph(
     # 1. GraphML
     graphml_path = out / _GRAPHML_FILE
     try:
-        ox.save_graphml(graph, filepath=str(graphml_path))
+        if ox is not None:
+            ox.save_graphml(graph, filepath=str(graphml_path))
+        else:
+            nx.write_graphml(graph, str(graphml_path))
         size_kb = graphml_path.stat().st_size / 1024
         logger.info("save_graph: saved %s (%.1f KB)", graphml_path, size_kb)
     except Exception:
@@ -418,7 +517,11 @@ def load_graph(input_dir: str) -> tuple:
     inp = Path(input_dir)
 
     try:
-        graph = ox.load_graphml(str(inp / _GRAPHML_FILE))
+        if ox is not None:
+            graph = ox.load_graphml(str(inp / _GRAPHML_FILE))
+        else:
+            graph = nx.read_graphml(str(inp / _GRAPHML_FILE), force_multigraph=True)
+            graph = nx.MultiDiGraph(graph)
         adj_matrix = load_npz(str(inp / _ADJ_FILE))
         node_features = pd.read_csv(str(inp / _FEATS_FILE))
 
@@ -487,4 +590,34 @@ def build_city_graph(city_name: str, config: dict) -> tuple:
     save_graph(graph, adj_matrix, node_feats, output_dir)
 
     logger.info("build_city_graph: built and saved graph for %s", city_name)
+    return graph, adj_matrix, node_feats
+
+
+def build_area_graph(
+    bbox: dict,
+    config: dict,
+    area_id: str | None = None,
+) -> tuple:
+    """Build or load cached graph artifacts for an arbitrary bbox area."""
+    b = _normalise_bbox(bbox)
+    resolved_area_id = area_id or _bbox_area_id(b)
+    output_dir = f"data/processed/areas/{resolved_area_id}/graph"
+    out = Path(output_dir)
+
+    artifacts_exist = (
+        (out / _GRAPHML_FILE).exists()
+        and (out / _ADJ_FILE).exists()
+        and (out / _FEATS_FILE).exists()
+    )
+
+    if artifacts_exist:
+        logger.info("build_area_graph: loading cached graph for area %s", resolved_area_id)
+        return load_graph(output_dir)
+
+    logger.info("build_area_graph: building graph for area %s", resolved_area_id)
+    graph = download_bbox_graph(b)
+    graph = assign_india_road_weights(graph)
+    adj_matrix = build_adjacency_matrix(graph)
+    node_feats = extract_node_features(graph)
+    save_graph(graph, adj_matrix, node_feats, output_dir)
     return graph, adj_matrix, node_feats

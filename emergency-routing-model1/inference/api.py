@@ -32,6 +32,8 @@ from inference.predict import (
     load_model_and_graph,
     fetch_live_features,
     build_inference_window,
+    run_prediction_for_bbox,
+    summarise_prediction_result,
 )
 from models.lstm_gcn import count_parameters
 from data.preprocess import FEATURE_COLUMNS
@@ -51,6 +53,8 @@ _startup_time: float = 0.0
 VALID_CITIES = ["Delhi", "Mumbai", "Bengaluru", "Chennai", "Patna"]
 
 _SPATIAL_COLS = ["avg_speed_limit", "avg_road_weight", "is_signal", "street_count"]
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_CONFIG_PATH = _PROJECT_ROOT / "config" / "config.yaml"
 
 
 # ---------------------------------------------------------------------------
@@ -63,6 +67,20 @@ class CityPredictRequest(BaseModel):
 
 class BatchPredictRequest(BaseModel):
     city_names: list[str]
+
+
+class BBox(BaseModel):
+    north: float
+    south: float
+    east: float
+    west: float
+
+
+class AreaPredictRequest(BaseModel):
+    bbox: BBox
+    area_id: str | None = None
+    reference_city: str | None = None
+    weather_context_city: str | None = None
 
 
 class PredictionResponse(BaseModel):
@@ -105,7 +123,7 @@ async def lifespan(app: FastAPI):
     global _config, _device, _model_cache, _startup_time
 
     # Load config
-    with open("config/config.yaml", "r") as f:
+    with open(_CONFIG_PATH, "r") as f:
         _config = yaml.safe_load(f)
 
     device_str = _config["training"].get("device", "cpu")
@@ -114,18 +132,23 @@ async def lifespan(app: FastAPI):
     )
     logger.info("API startup: using device %s", _device)
 
-    # Pre-load models for all cities
-    for city_entry in _config["data"]["cities"]:
-        city_name = city_entry if isinstance(city_entry, str) else city_entry["name"]
-        try:
-            artifacts = load_model_and_graph(city_name, _config, _device)
-            _model_cache[city_name] = artifacts
-            logger.info("API startup: loaded model for %s", city_name)
-        except Exception:
-            logger.error(
-                "API startup: failed to load model for %s — city will be unavailable",
-                city_name, exc_info=True,
-            )
+    preload_models = os.getenv("PRELOAD_MODELS", "false").strip().lower() == "true"
+
+    # Optionally preload models; default is lazy loading for fast startup.
+    if preload_models:
+        for city_entry in _config["data"]["cities"]:
+            city_name = city_entry if isinstance(city_entry, str) else city_entry["name"]
+            try:
+                artifacts = load_model_and_graph(city_name, _config, _device)
+                _model_cache[city_name] = artifacts
+                logger.info("API startup: loaded model for %s", city_name)
+            except Exception:
+                logger.error(
+                    "API startup: failed to load model for %s — city will be unavailable",
+                    city_name, exc_info=True,
+                )
+    else:
+        logger.info("API startup: lazy model loading enabled (PRELOAD_MODELS=false)")
 
     _startup_time = time.time()
     logger.info(
@@ -231,17 +254,18 @@ def _predict_from_cache(city_name: str) -> PredictionResponse:
     result = model.predict_congestion(x_temporal, x_spatial, edge_index, edge_weight)
     latency_ms = (time.perf_counter() - t_start) * 1000.0
 
+    summary = summarise_prediction_result(result)
     return PredictionResponse(
         city=city_name,
         timestamp=datetime.now(timezone.utc).isoformat(),
-        congestion_t5=float(np.mean(result["congestion_t5"])),
-        congestion_t10=float(np.mean(result["congestion_t10"])),
-        congestion_t20=float(np.mean(result["congestion_t20"])),
-        congestion_t30=float(np.mean(result["congestion_t30"])),
-        uncertainty_t5=float(np.mean(result["uncertainty_t5"])),
-        uncertainty_t10=float(np.mean(result["uncertainty_t10"])),
-        uncertainty_t20=float(np.mean(result["uncertainty_t20"])),
-        uncertainty_t30=float(np.mean(result["uncertainty_t30"])),
+        congestion_t5=summary["congestion_t5"],
+        congestion_t10=summary["congestion_t10"],
+        congestion_t20=summary["congestion_t20"],
+        congestion_t30=summary["congestion_t30"],
+        uncertainty_t5=summary["uncertainty_t5"],
+        uncertainty_t10=summary["uncertainty_t10"],
+        uncertainty_t20=summary["uncertainty_t20"],
+        uncertainty_t30=summary["uncertainty_t30"],
         latency_ms=latency_ms,
     )
 
@@ -276,10 +300,13 @@ def predict(request: CityPredictRequest) -> PredictionResponse:
         )
 
     if city_name not in _model_cache:
-        raise HTTPException(
-            status_code=503,
-            detail=f"Model for '{city_name}' is not loaded (startup may have failed).",
-        )
+        try:
+            _model_cache[city_name] = load_model_and_graph(city_name, _config, _device)
+        except Exception as e:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Model for '{city_name}' could not be loaded: {e}",
+            )
 
     try:
         return _predict_from_cache(city_name)
@@ -325,6 +352,35 @@ def predict_batch(request: BatchPredictRequest) -> list:
     return results
 
 
+@app.post("/predict/area")
+def predict_area(request: AreaPredictRequest) -> dict:
+    """Return live congestion prediction for any India bbox area."""
+    bbox = request.bbox.model_dump()
+
+    # Basic geographic sanity checks for India-ish extents.
+    if not (6.0 <= bbox["south"] <= 38.5 and 6.0 <= bbox["north"] <= 38.5):
+        raise HTTPException(status_code=422, detail="bbox latitude must be within India range (6.0 to 38.5)")
+    if not (68.0 <= bbox["west"] <= 97.5 and 68.0 <= bbox["east"] <= 97.5):
+        raise HTTPException(status_code=422, detail="bbox longitude must be within India range (68.0 to 97.5)")
+    if bbox["north"] <= bbox["south"]:
+        raise HTTPException(status_code=422, detail="bbox north must be greater than south")
+    if bbox["east"] <= bbox["west"]:
+        raise HTTPException(status_code=422, detail="bbox east must be greater than west")
+
+    try:
+        return run_prediction_for_bbox(
+            bbox=bbox,
+            config=_config,
+            device=_device,
+            area_id=request.area_id,
+            weather_context_city=request.weather_context_city,
+            reference_city=request.reference_city,
+        )
+    except Exception as e:
+        logger.error("predict_area: inference failed", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/model/info", response_model=ModelInfoResponse)
 def model_info() -> ModelInfoResponse:
     """Return architecture metadata for the loaded model."""
@@ -362,7 +418,7 @@ if __name__ == "__main__":
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
     # Config is also loaded inside lifespan; load here only for host/port
-    with open("config/config.yaml", "r") as f:
+    with open(_CONFIG_PATH, "r") as f:
         _launch_config = yaml.safe_load(f)
 
     uvicorn.run(

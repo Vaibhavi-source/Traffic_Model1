@@ -20,16 +20,18 @@ from pathlib import Path
 from datetime import datetime, timezone
 from scipy.sparse import csr_matrix
 from dotenv import load_dotenv
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import MinMaxScaler
+from typing import cast
 
 from models.lstm_gcn import EmergencyTrafficModel, build_model
-from data.build_graph import build_city_graph
+from data.build_graph import build_city_graph, build_area_graph
 from data.fetch_traffic import fetch_all_sources
 from data.fetch_weather import fetch_city_weather, merge_weather_with_traffic
 from data.preprocess import FEATURE_COLUMNS
 
 load_dotenv()
 logger = logging.getLogger(__name__)
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 # Node feature columns for spatial projection (4 → gcn_input_dim)
 _SPATIAL_COLS = ["avg_speed_limit", "avg_road_weight", "is_signal", "street_count"]
@@ -41,6 +43,116 @@ _LIVE_DEFAULTS: dict = {
     "incident_flag":      0.0,
 }
 
+_DEFAULT_HORIZON_KEYS = [
+    "congestion_t5",
+    "congestion_t10",
+    "congestion_t20",
+    "congestion_t30",
+    "uncertainty_t5",
+    "uncertainty_t10",
+    "uncertainty_t20",
+    "uncertainty_t30",
+]
+
+
+def _bbox_center(bbox: dict) -> tuple[float, float]:
+    """Return (lat, lon) center for a bbox dict."""
+    lat = (float(bbox["north"]) + float(bbox["south"])) / 2.0
+    lon = (float(bbox["east"]) + float(bbox["west"])) / 2.0
+    return lat, lon
+
+
+def _dist_sq(a: tuple[float, float], b: tuple[float, float]) -> float:
+    """Squared Euclidean distance in lat/lon space."""
+    return (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2
+
+
+def summarise_prediction_result(result: dict) -> dict:
+    """Convert model output arrays into a flat float summary dict.
+
+    Keeps standard t5/t10/t20/t30 keys for backward compatibility,
+    filling with NaN when the model has fewer horizons.
+    """
+    summary: dict = {k: float("nan") for k in _DEFAULT_HORIZON_KEYS}
+
+    for key, value in result.items():
+        if key.startswith("congestion_") or key.startswith("uncertainty_"):
+            summary[key] = float(np.mean(value))
+
+    return summary
+
+
+def _resolve_reference_city(
+    config: dict,
+    requested_city: str | None,
+    bbox: dict | None = None,
+) -> str:
+    """Pick a valid reference city that has a fitted scaler on disk."""
+    processed_dir = Path(config["data"]["processed_data_dir"])
+    if not processed_dir.is_absolute():
+        processed_dir = _PROJECT_ROOT / processed_dir
+
+    if requested_city:
+        req_scaler = processed_dir / requested_city / "scaler.pkl"
+        if req_scaler.exists():
+            return requested_city
+
+    candidates: list[tuple[str, Path, dict | None]] = []
+    for city_entry in config["data"]["cities"]:
+        city_name = city_entry if isinstance(city_entry, str) else city_entry.get("name", "")
+        scaler_path = processed_dir / city_name / "scaler.pkl"
+        city_bbox = city_entry.get("bbox") if isinstance(city_entry, dict) else None
+        if scaler_path.exists():
+            candidates.append((city_name, scaler_path, city_bbox))
+
+    if bbox and candidates:
+        target_center = _bbox_center(bbox)
+        with_bbox: list[tuple[str, Path, dict]] = [
+            (name, scaler_path, city_bbox)
+            for name, scaler_path, city_bbox in candidates
+            if city_bbox is not None
+        ]
+        if with_bbox:
+            nearest = min(
+                with_bbox,
+                key=lambda c: _dist_sq(target_center, _bbox_center(cast(dict, c[2]))),
+            )
+            return nearest[0]
+
+    if candidates:
+        return candidates[0][0]
+
+    raise FileNotFoundError(
+        "No fitted scaler found in data/processed for any configured city. "
+        "Run preprocessing first."
+    )
+
+
+def _config_for_checkpoint(config: dict, ckpt: dict) -> dict:
+    """Return a config copy with model horizons aligned to checkpoint tensors."""
+    cfg = dict(config)
+    cfg["model"] = dict(config["model"])
+
+    head_bias = ckpt.get("model_state_dict", {}).get("pred_head.3.bias")
+    if head_bias is None:
+        return cfg
+
+    try:
+        ckpt_horizons = int(head_bias.shape[0])
+    except Exception:
+        return cfg
+
+    if cfg["model"].get("num_prediction_horizons") != ckpt_horizons:
+        logger.warning(
+            "load_model_and_graph: config horizons=%s but checkpoint horizons=%d; "
+            "using checkpoint value for model construction",
+            cfg["model"].get("num_prediction_horizons"),
+            ckpt_horizons,
+        )
+        cfg["model"]["num_prediction_horizons"] = ckpt_horizons
+
+    return cfg
+
 
 # ---------------------------------------------------------------------------
 # load_model_and_graph
@@ -50,7 +162,7 @@ def load_model_and_graph(
     city_name: str,
     config: dict,
     device: torch.device,
-) -> tuple[EmergencyTrafficModel, nn.Linear, csr_matrix, pd.DataFrame, StandardScaler]:
+) -> tuple[EmergencyTrafficModel, nn.Linear, csr_matrix, pd.DataFrame, MinMaxScaler]:
     """Load all inference artifacts for a city.
 
     Loads the model checkpoint, spatial projection layer, road graph,
@@ -71,16 +183,18 @@ def load_model_and_graph(
     FileNotFoundError  If checkpoint or scaler is missing.
     Exception          Re-raised on any load failure.
     """
-    ckpt_path = (
-        Path(config["training"]["checkpoint_dir"]) / "best_model.pt"
-    )
+    ckpt_dir = Path(config["training"]["checkpoint_dir"])
+    if not ckpt_dir.is_absolute():
+        ckpt_dir = _PROJECT_ROOT / ckpt_dir
+    ckpt_path = ckpt_dir / "best_model.pt"
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
     try:
         ckpt = torch.load(str(ckpt_path), map_location=device)
 
-        model = build_model(config).to(device)
+        model_cfg = _config_for_checkpoint(config, ckpt)
+        model = build_model(model_cfg).to(device)
         model.load_state_dict(ckpt["model_state_dict"])
         model.eval()
 
@@ -117,9 +231,10 @@ def load_model_and_graph(
         raise
 
     # Scaler
-    scaler_path = (
-        Path(config["data"]["processed_data_dir"]) / city_name / "scaler.pkl"
-    )
+    processed_dir = Path(config["data"]["processed_data_dir"])
+    if not processed_dir.is_absolute():
+        processed_dir = _PROJECT_ROOT / processed_dir
+    scaler_path = processed_dir / city_name / "scaler.pkl"
     if not scaler_path.exists():
         raise FileNotFoundError(f"Scaler not found: {scaler_path}")
 
@@ -168,7 +283,23 @@ def fetch_live_features(
             "fetch_live_features: fetch_all_sources failed for %s",
             city_name, exc_info=True,
         )
-        raise
+        traffic_df = pd.DataFrame()
+
+    if traffic_df.empty:
+        raw_dir = Path(config["data"]["raw_data_dir"])
+        if not raw_dir.is_absolute():
+            raw_dir = _PROJECT_ROOT / raw_dir
+
+        city_raw = raw_dir / city_name
+        parquet_files = sorted(city_raw.rglob("*.parquet")) if city_raw.exists() else []
+        if parquet_files:
+            latest = parquet_files[-1]
+            logger.warning(
+                "fetch_live_features: using cached traffic file %s for %s",
+                latest,
+                city_name,
+            )
+            traffic_df = pd.read_parquet(str(latest))
 
     try:
         weather_dict = fetch_city_weather(
@@ -204,7 +335,7 @@ def fetch_live_features(
 
 def build_inference_window(
     live_df: pd.DataFrame,
-    scaler: StandardScaler,
+    scaler: MinMaxScaler,
     config: dict,
 ) -> np.ndarray:
     """Build a single (1, window_size, 12) inference tensor from live data.
@@ -332,25 +463,66 @@ def run_prediction(
 
     latency_ms = (time.perf_counter() - t_start) * 1000.0
 
+    summary = summarise_prediction_result(result)
     logger.info(
         "run_prediction: %s congestion_t5=%.4f latency=%.1f ms",
         city_name,
-        float(result["congestion_t5"].mean()),
+        summary.get("congestion_t5", float("nan")),
         latency_ms,
     )
 
     return {
-        "city":            city_name,
-        "timestamp":       datetime.now(timezone.utc).isoformat(),
-        "congestion_t5":   float(np.mean(result["congestion_t5"])),
-        "congestion_t10":  float(np.mean(result["congestion_t10"])),
-        "congestion_t20":  float(np.mean(result["congestion_t20"])),
-        "congestion_t30":  float(np.mean(result["congestion_t30"])),
-        "uncertainty_t5":  float(np.mean(result["uncertainty_t5"])),
-        "uncertainty_t10": float(np.mean(result["uncertainty_t10"])),
-        "uncertainty_t20": float(np.mean(result["uncertainty_t20"])),
-        "uncertainty_t30": float(np.mean(result["uncertainty_t30"])),
-        "latency_ms":      latency_ms,
+        "city":      city_name,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "latency_ms": latency_ms,
+        **summary,
+    }
+
+
+def run_prediction_for_bbox(
+    bbox: dict,
+    config: dict,
+    device: torch.device,
+    area_id: str | None = None,
+    weather_context_city: str | None = None,
+    reference_city: str | None = None,
+) -> dict:
+    """Run live inference for an arbitrary India area defined by bbox."""
+    ref_city = _resolve_reference_city(config, reference_city, bbox=bbox)
+
+    # Reuse model weights/scaler from a reference city and build graph for requested bbox.
+    model, spatial_proj, _, _, scaler = load_model_and_graph(ref_city, config, device)
+    _, adj_matrix, node_features = build_area_graph(bbox=bbox, config=config, area_id=area_id)
+
+    label = area_id or weather_context_city or "india_area"
+    weather_city = weather_context_city or ref_city
+
+    t_start = time.perf_counter()
+    live_df = fetch_live_features(weather_city, bbox, config)
+
+    x_window = build_inference_window(live_df, scaler, config)
+    x_temporal = torch.tensor(x_window, dtype=torch.float32).to(device)
+
+    coo = adj_matrix.tocoo()
+    edge_index = torch.tensor(np.vstack([coo.row, coo.col]), dtype=torch.long).to(device)
+    edge_weight = torch.tensor(coo.data, dtype=torch.float32).to(device)
+
+    x_spatial_raw = torch.tensor(node_features[_SPATIAL_COLS].values, dtype=torch.float32).to(device)
+    with torch.no_grad():
+        x_spatial = spatial_proj(x_spatial_raw)
+
+    result = model.predict_congestion(x_temporal, x_spatial, edge_index, edge_weight)
+    latency_ms = (time.perf_counter() - t_start) * 1000.0
+    summary = summarise_prediction_result(result)
+
+    return {
+        "area": label,
+        "reference_city": ref_city,
+        "weather_context_city": weather_city,
+        "bbox": bbox,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "latency_ms": latency_ms,
+        **summary,
     }
 
 

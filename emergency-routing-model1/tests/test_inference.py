@@ -38,8 +38,9 @@ def _make_merged_df(n_rows: int = 20) -> pd.DataFrame:
     return df
 
 
-def _fitted_scaler(n_rows: int = 100) -> StandardScaler:
-    scaler = StandardScaler()
+def _fitted_scaler(n_rows: int = 100) -> MinMaxScaler:
+    from sklearn.preprocessing import MinMaxScaler
+    scaler = MinMaxScaler()
     scaler.fit(np.random.default_rng(0).random((n_rows, len(FEATURE_COLUMNS))))
     return scaler
 
@@ -379,3 +380,37 @@ class TestAPIEndpoints:
         resp = client.get("/model/info")
         assert resp.status_code == 200
         assert "parameter_count" in resp.json()
+
+    # --- POST /predict/area ---
+
+    @patch("inference.api.run_prediction_for_bbox")
+    def test_predict_area_valid_bbox(self, mock_rpab, client):
+        mock_rpab.return_value = {
+            "area": "any_area",
+            "reference_city": "Delhi",
+            "weather_context_city": "Delhi",
+            "bbox": {"north": 28.70, "south": 28.60, "east": 77.30, "west": 77.10},
+            "timestamp": "2026-01-01T00:00:00+00:00",
+            "latency_ms": 12.3,
+            "congestion_t5": 0.4,
+            "uncertainty_t5": 0.05,
+        }
+
+        resp = client.post(
+            "/predict/area",
+            json={
+                "bbox": {"north": 28.70, "south": 28.60, "east": 77.30, "west": 77.10},
+                "area_id": "any_area",
+            },
+        )
+
+        assert resp.status_code == 200
+        assert "congestion_t5" in resp.json()
+
+    def test_predict_area_rejects_out_of_india_bbox(self, client):
+        resp = client.post(
+            "/predict/area",
+            json={"bbox": {"north": 55.0, "south": 54.0, "east": 5.0, "west": 4.0}},
+        )
+
+        assert resp.status_code == 422
