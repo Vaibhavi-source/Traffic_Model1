@@ -1,0 +1,28 @@
+{
+  "expo": {
+    "name": "Emergency Routing",
+    "slug": "emergency-routing",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "backgroundColor": "#0a0a0f",
+    "platforms": ["ios", "android"],
+    "plugins": ["expo-router"],
+    "scheme": "emergency-routing",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.emergencyrouting.model1"
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#0a0a0f"
+      },
+      "package": "com.emergencyrouting.model1"
+    },
+    "extra": {
+      "router": {
+        "origin": false
+      }
+    }
+  }
+}
