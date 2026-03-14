@@ -23,7 +23,6 @@ import logging
 import pandas as pd
 import numpy as np
 from datetime import datetime, timezone
-from typing import Optional
 from dotenv import load_dotenv
 from data.fetch_traffic import fetch_with_retry
 
