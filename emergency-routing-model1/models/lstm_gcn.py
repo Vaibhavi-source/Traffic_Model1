@@ -54,7 +54,7 @@ class LSTMEncoder(nn.Module):
 
 
 class EmergencyTrafficModel(nn.Module):
-        """Main hybrid LSTM+GCN model with attention-based fusion layer.
+    """Main hybrid LSTM+GCN model with attention-based fusion layer.
 
         Architecture:
             1. LSTMEncoder       — temporal patterns (rush hour, monsoon, festivals)
