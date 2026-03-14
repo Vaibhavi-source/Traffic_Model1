@@ -4,6 +4,10 @@ import pytest
 import time
 from fastapi.testclient import TestClient
 
+# TODO: uncomment when inference/api.py is fully implemented
+# from inference.api import app
+# client = TestClient(app)
+
 
 def test_health_endpoint_returns_200() -> None:
     """Test that health endpoint returns HTTP 200."""

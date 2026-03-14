@@ -3,6 +3,7 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import torch
+import torch.nn as nn
 import numpy as np
 import logging
 import yaml
