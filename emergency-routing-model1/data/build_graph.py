@@ -517,10 +517,20 @@ def load_graph(input_dir: str) -> tuple:
     inp = Path(input_dir)
 
     try:
+        graphml_path = str(inp / _GRAPHML_FILE)
         if ox is not None:
-            graph = ox.load_graphml(str(inp / _GRAPHML_FILE))
+            try:
+                graph = ox.load_graphml(graphml_path)
+            except (AttributeError, Exception) as _ox_err:
+                # Fallback for OSMnx version mismatches with saved GraphML
+                logger.warning(
+                    "load_graph: ox.load_graphml failed (%s) — falling back to nx.read_graphml",
+                    _ox_err,
+                )
+                graph = nx.read_graphml(graphml_path, force_multigraph=True)
+                graph = nx.MultiDiGraph(graph)
         else:
-            graph = nx.read_graphml(str(inp / _GRAPHML_FILE), force_multigraph=True)
+            graph = nx.read_graphml(graphml_path, force_multigraph=True)
             graph = nx.MultiDiGraph(graph)
         adj_matrix = load_npz(str(inp / _ADJ_FILE))
         node_features = pd.read_csv(str(inp / _FEATS_FILE))

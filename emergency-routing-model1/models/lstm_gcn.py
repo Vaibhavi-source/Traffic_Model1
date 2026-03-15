@@ -44,7 +44,8 @@ class _FallbackGCNConv(nn.Module):
 
     def __init__(self, in_features: int, out_features: int) -> None:
         super().__init__()
-        self.linear = nn.Linear(in_features, out_features)
+        self.lin = nn.Linear(in_features, out_features, bias=False)
+        self.bias = nn.Parameter(torch.zeros(out_features))
 
     def forward(
         self,
@@ -81,7 +82,7 @@ class _FallbackGCNConv(nn.Module):
 
         out = torch.zeros_like(x)
         out = out.index_add(0, row, x[col] * norm.unsqueeze(-1))
-        return self.linear(out)
+        return self.lin(out) + self.bias
 
 
 # ---------------------------------------------------------------------------
