@@ -35,20 +35,81 @@ class IndiaFactor {
   });
 }
 
+// ── Weather condition at route location ────────────────────────────────────
+
+class WeatherCondition {
+  final String label;         // "Heavy Rain", "Dense Fog", "Clear", etc.
+  final String emoji;
+  final double delayMultiplier;
+  final String description;   // Human-readable impact on emergency routing
+  final Color color;
+  final double? temperatureC;
+  final double? windSpeedKmh;
+  final double? precipitationMm;
+  final int weatherCode;      // WMO weather code
+
+  const WeatherCondition({
+    required this.label,
+    required this.emoji,
+    required this.delayMultiplier,
+    required this.description,
+    required this.color,
+    this.temperatureC,
+    this.windSpeedKmh,
+    this.precipitationMm,
+    required this.weatherCode,
+  });
+
+  bool get isSevere => delayMultiplier >= 1.15;
+  bool get isClear => delayMultiplier <= 1.02;
+}
+
+// ── Road condition ─────────────────────────────────────────────────────────
+
+class RoadCondition {
+  final String name;
+  final String emoji;
+  final double delayMultiplier;
+  final String description;
+  final Color color;
+
+  const RoadCondition({
+    required this.name,
+    required this.emoji,
+    required this.delayMultiplier,
+    required this.description,
+    required this.color,
+  });
+}
+
+// ── Combined India factors ─────────────────────────────────────────────────
+
 class IndiaFactors {
   final List<IndiaFactor> active;
   final double totalMultiplier;
   final bool isRushHour;
   final bool isMonsoon;
+  final WeatherCondition? weather;           // Live weather at route location
+  final List<RoadCondition> roadConditions;  // Road-specific hazards
 
   const IndiaFactors({
     required this.active,
     required this.totalMultiplier,
     required this.isRushHour,
     required this.isMonsoon,
+    this.weather,
+    this.roadConditions = const [],
   });
 
-  bool get hasFactors => active.isNotEmpty || isRushHour || isMonsoon;
+  bool get hasFactors =>
+      active.isNotEmpty ||
+      isRushHour ||
+      isMonsoon ||
+      (weather != null && !weather!.isClear) ||
+      roadConditions.isNotEmpty;
+
+  bool get hasWeatherOrRoad =>
+      (weather != null && !weather!.isClear) || roadConditions.isNotEmpty;
 }
 
 // ── Route result model ─────────────────────────────────────────────────────

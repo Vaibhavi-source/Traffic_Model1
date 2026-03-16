@@ -4,6 +4,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_animate/flutter_animate.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:geolocator/geolocator.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:latlong2/latlong.dart';
 
@@ -68,6 +69,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
 
   // Loading
   bool _isRouting = false;
+  bool _isLocating = false;
   String _loadingMessage = 'Analyzing route...';
 
   // Services
@@ -146,6 +148,55 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
       _city = city;
       _mapCtrl.move(LatLng(city.lat, city.lng), 13.0);
     });
+  }
+
+  // ── GPS: use device location as origin ────────────────────────────────────
+
+  Future<void> _useMyLocation() async {
+    setState(() => _isLocating = true);
+    try {
+      // Check/request permission
+      LocationPermission permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+        if (permission == LocationPermission.denied) {
+          _snack('Location permission denied.', error: true);
+          return;
+        }
+      }
+      if (permission == LocationPermission.deniedForever) {
+        _snack('Location permission permanently denied — enable in Settings.',
+            error: true);
+        return;
+      }
+
+      // Get current position
+      final pos = await Geolocator.getCurrentPosition(
+        desiredAccuracy: LocationAccuracy.high,
+        timeLimit: const Duration(seconds: 10),
+      );
+      final coord = LatLng(pos.latitude, pos.longitude);
+
+      // Reverse-geocode to human-readable address via Nominatim
+      String displayName = '${pos.latitude.toStringAsFixed(5)}, ${pos.longitude.toStringAsFixed(5)}';
+      try {
+        final results = await _routingService.reverseGeocode(pos.latitude, pos.longitude);
+        if (results != null) displayName = results;
+      } catch (_) {}
+
+      setState(() {
+        _originCoord = coord;
+        _originCtrl.text = displayName;
+        _phase = _Phase.searching;
+      });
+
+      // Move map to user position
+      _mapCtrl.move(coord, 15.0);
+    } catch (e) {
+      _snack('Could not get location: $e', error: true);
+    } finally {
+      if (mounted) setState(() => _isLocating = false);
+    }
   }
 
   // ── Routing flow ───────────────────────────────────────────────────────────
@@ -685,19 +736,47 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
 
         const SizedBox(height: 8),
 
-        // Origin field
+        // Origin field + GPS button
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: 20),
           child: Column(children: [
-            _LocationField(
-              controller: _originCtrl,
-              focusNode: _originFocus,
-              hint: 'Pickup / Station location',
-              icon: Icons.radio_button_checked,
-              iconColor: kAiCyan,
-              accentColor: kAiCyan,
-              onChanged: (v) => _onInputChanged(v, true),
-            ),
+            Row(children: [
+              Expanded(
+                child: _LocationField(
+                  controller: _originCtrl,
+                  focusNode: _originFocus,
+                  hint: 'Pickup / Station location',
+                  icon: Icons.radio_button_checked,
+                  iconColor: kAiCyan,
+                  accentColor: kAiCyan,
+                  onChanged: (v) => _onInputChanged(v, true),
+                ),
+              ),
+              const SizedBox(width: 8),
+              // GPS "Use My Location" button
+              GestureDetector(
+                onTap: _isLocating ? null : _useMyLocation,
+                child: AnimatedContainer(
+                  duration: const Duration(milliseconds: 200),
+                  width: 48,
+                  height: 48,
+                  decoration: BoxDecoration(
+                    color: _isLocating
+                        ? kAiCyan.withOpacity(0.08)
+                        : kAiCyan.withOpacity(0.15),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: kAiCyan.withOpacity(0.4)),
+                  ),
+                  child: _isLocating
+                      ? const Padding(
+                          padding: EdgeInsets.all(12),
+                          child: CircularProgressIndicator(
+                              strokeWidth: 2, color: kAiCyan),
+                        )
+                      : const Icon(Icons.my_location, color: kAiCyan, size: 22),
+                ),
+              ),
+            ]),
             const SizedBox(height: 4),
             // Vertical dots connector
             Padding(
@@ -815,14 +894,26 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
             .slideY(begin: 0.3, end: 0, duration: 350.ms, curve: Curves.easeOut)
             .fadeIn(duration: 280.ms),
 
-        // India factors
-        if (result.indiaFactors.hasFactors) ...[
+        // India cultural/festival factors
+        if (result.indiaFactors.active.isNotEmpty) ...[
           const SizedBox(height: 10),
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 20),
             child: _IndiaFactorsCard(factors: result.indiaFactors),
           )
               .animate(delay: 100.ms)
+              .slideY(begin: 0.2, end: 0, duration: 300.ms)
+              .fadeIn(duration: 250.ms),
+        ],
+
+        // Weather + Road conditions card
+        if (result.indiaFactors.hasWeatherOrRoad) ...[
+          const SizedBox(height: 10),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 20),
+            child: _WeatherRoadCard(factors: result.indiaFactors),
+          )
+              .animate(delay: 150.ms)
               .slideY(begin: 0.2, end: 0, duration: 300.ms)
               .fadeIn(duration: 250.ms),
         ],
@@ -1569,7 +1660,7 @@ class _IndiaFactorsCard extends StatelessWidget {
         Row(children: [
           const Icon(Icons.flag, color: kWarning, size: 13),
           const SizedBox(width: 6),
-          Text('INDIA-SPECIFIC FACTORS DETECTED',
+          Text('INDIA-SPECIFIC FACTORS — ${factors.active.length} DETECTED',
               style: GoogleFonts.rajdhani(
                   color: kWarning,
                   fontSize: 9,
@@ -1613,6 +1704,159 @@ class _IndiaFactorsCard extends StatelessWidget {
           style: GoogleFonts.rajdhani(
               color: kTextSecondary, fontSize: 11, fontStyle: FontStyle.italic),
         ),
+      ]),
+    );
+  }
+}
+
+// ── Weather + Road conditions card ─────────────────────────────────────────
+
+class _WeatherRoadCard extends StatelessWidget {
+  final IndiaFactors factors;
+  const _WeatherRoadCard({required this.factors});
+
+  @override
+  Widget build(BuildContext context) {
+    final weather = factors.weather;
+    final roads = factors.roadConditions;
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      decoration: BoxDecoration(
+        color: const Color(0xFF0E0E0E),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: const Color(0xFF0288D1).withOpacity(0.3)),
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        // Header
+        Row(children: [
+          const Icon(Icons.cloud, color: Color(0xFF4FC3F7), size: 13),
+          const SizedBox(width: 6),
+          Text('WEATHER & ROAD CONDITIONS',
+              style: GoogleFonts.rajdhani(
+                  color: const Color(0xFF4FC3F7),
+                  fontSize: 9,
+                  fontWeight: FontWeight.bold,
+                  letterSpacing: 1.2)),
+          const Spacer(),
+          Text('LIVE', style: GoogleFonts.rajdhani(
+              color: const Color(0xFF00E676), fontSize: 9, letterSpacing: 1.2,
+              fontWeight: FontWeight.bold)),
+        ]),
+
+        const SizedBox(height: 10),
+
+        // Weather row
+        if (weather != null) ...[
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+            decoration: BoxDecoration(
+              color: weather.color.withOpacity(0.08),
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: weather.color.withOpacity(0.3)),
+            ),
+            child: Row(children: [
+              Text(weather.emoji, style: const TextStyle(fontSize: 18)),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(children: [
+                        Text(weather.label,
+                            style: GoogleFonts.rajdhani(
+                                color: weather.color,
+                                fontSize: 13,
+                                fontWeight: FontWeight.bold)),
+                        if (!weather.isClear) ...[
+                          const SizedBox(width: 6),
+                          Container(
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 5, vertical: 2),
+                            decoration: BoxDecoration(
+                              color: weather.color.withOpacity(0.15),
+                              borderRadius: BorderRadius.circular(4),
+                            ),
+                            child: Text(
+                              '+${((weather.delayMultiplier - 1) * 100).toStringAsFixed(0)}%',
+                              style: GoogleFonts.rajdhani(
+                                  color: weather.color,
+                                  fontSize: 9,
+                                  fontWeight: FontWeight.bold),
+                            ),
+                          ),
+                        ],
+                      ]),
+                      Text(weather.description,
+                          style: GoogleFonts.rajdhani(
+                              color: kTextSecondary, fontSize: 11, height: 1.3)),
+                    ]),
+              ),
+              // Weather stats column
+              Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
+                if (weather.temperatureC != null)
+                  Text('${weather.temperatureC!.toStringAsFixed(0)}°C',
+                      style: GoogleFonts.rajdhani(
+                          color: Colors.white70, fontSize: 13,
+                          fontWeight: FontWeight.w600)),
+                if (weather.windSpeedKmh != null && weather.windSpeedKmh! > 0)
+                  Text('💨 ${weather.windSpeedKmh!.toStringAsFixed(0)} km/h',
+                      style: GoogleFonts.rajdhani(
+                          color: kTextSecondary, fontSize: 10)),
+                if (weather.precipitationMm != null &&
+                    weather.precipitationMm! > 0)
+                  Text('🌧 ${weather.precipitationMm!.toStringAsFixed(1)} mm',
+                      style: GoogleFonts.rajdhani(
+                          color: kTextSecondary, fontSize: 10)),
+              ]),
+            ]),
+          ),
+          if (roads.isNotEmpty) const SizedBox(height: 8),
+        ],
+
+        // Road conditions
+        if (roads.isNotEmpty)
+          Wrap(
+            spacing: 8,
+            runSpacing: 6,
+            children: roads.map((rc) {
+              return Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                decoration: BoxDecoration(
+                  color: rc.color.withOpacity(0.1),
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: rc.color.withOpacity(0.35)),
+                ),
+                child: Row(mainAxisSize: MainAxisSize.min, children: [
+                  Text(rc.emoji, style: const TextStyle(fontSize: 12)),
+                  const SizedBox(width: 5),
+                  Text(rc.name,
+                      style: GoogleFonts.rajdhani(
+                          color: rc.color,
+                          fontSize: 11,
+                          fontWeight: FontWeight.bold)),
+                  const SizedBox(width: 4),
+                  Text(
+                    '+${((rc.delayMultiplier - 1) * 100).toStringAsFixed(0)}%',
+                    style: GoogleFonts.rajdhani(
+                        color: rc.color.withOpacity(0.7), fontSize: 10),
+                  ),
+                ]),
+              );
+            }).toList(),
+          ),
+
+        if (roads.isNotEmpty) ...[
+          const SizedBox(height: 8),
+          Text(
+            'Real-time conditions factored into AI route calculation.',
+            style: GoogleFonts.rajdhani(
+                color: kTextSecondary,
+                fontSize: 11,
+                fontStyle: FontStyle.italic),
+          ),
+        ],
       ]),
     );
   }
